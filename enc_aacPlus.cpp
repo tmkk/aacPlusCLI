@@ -91,7 +91,6 @@ Example:
 #include <fcntl.h>
 #include <stdlib.h>
 #include <process.h>
-#include <string>
 
 // transcode() returns one of these:
 #define TRANSCODE_FINISHED_OK        0
@@ -107,6 +106,14 @@ Example:
 #define ERROR_INSUFFICIENT_ARGS     -9
 
 #define BUFSIZE 32768
+
+#define SWAP32(n) ((((n)>>24)&0xff) | (((n)>>8)&0xff00) | (((n)<<8)&0xff0000) | (((n)<<24)&0xff000000))
+#define SWAP16(n) ((((n)>>8)&0xff) | (((n)<<8)&0xff00))
+
+#ifdef _MSC_VER
+#define fseeko _fseeki64
+#define ftello _ftelli64
+#endif
 
 class AudioCoder
 {
@@ -131,6 +138,182 @@ typedef struct wavHeader {
   unsigned int data;
   unsigned int datasize;
 } wavHeader;
+
+static void optimizeAtoms(FILE *fp, __int64 origSize)
+{
+	unsigned int tmp;
+	unsigned int moovSize;
+	char atom[4];
+	
+	if(!fp) return;
+	
+	unsigned int bufferSize = 1024*1024;
+	char *tmpbuf = (char *)malloc(bufferSize);
+	char *tmpbuf2 = (char *)malloc(bufferSize);
+	char *read = tmpbuf;
+	char *write = tmpbuf2;
+	char *swap;
+	char *moovbuf = NULL;
+	int i;
+	bool moov_after_mdat = false;
+	
+	while(1) { //skip until moov;
+		if(fread(&tmp,4,1,fp) < 1) goto end;
+		if(fread(atom,1,4,fp) < 4) goto end;
+		tmp = SWAP32(tmp);
+		if(!memcmp(atom,"moov",4)) break;
+		if(!memcmp(atom,"mdat",4)) moov_after_mdat = true;
+		if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+	}
+	
+	if(!moov_after_mdat) goto end;
+	
+	__int64 pos_moov = ftello(fp) - 8;
+	moovSize = tmp;
+
+	unsigned int bytesRead = 0;
+	while(bytesRead < moovSize-8) {
+		if(fread(&tmp,4,1,fp) < 1) goto end;
+		if(fread(atom,1,4,fp) < 4) goto end;
+		tmp = SWAP32(tmp);
+		bytesRead += tmp;
+		if(memcmp(atom,"trak",4)) {
+			if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+			continue;
+		}
+
+		__int64 pos_next = ftello(fp) + tmp - 8;
+		
+		while(1) { //skip until mdia;
+			if(fread(&tmp,4,1,fp) < 1) goto end;
+			if(fread(atom,1,4,fp) < 4) goto end;
+			tmp = SWAP32(tmp);
+			if(!memcmp(atom,"mdia",4)) break;
+			if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+		}
+		
+		while(1) { //skip until minf;
+			if(fread(&tmp,4,1,fp) < 1) goto end;
+			if(fread(atom,1,4,fp) < 4) goto end;
+			tmp = SWAP32(tmp);
+			if(!memcmp(atom,"minf",4)) break;
+			if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+		}
+		
+		while(1) { //skip until stbl;
+			if(fread(&tmp,4,1,fp) < 1) goto end;
+			if(fread(atom,1,4,fp) < 4) goto end;
+			tmp = SWAP32(tmp);
+			if(!memcmp(atom,"stbl",4)) break;
+			if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+		}
+		
+		while(1) { //skip until stco;
+			if(fread(&tmp,4,1,fp) < 1) goto end;
+			if(fread(atom,1,4,fp) < 4) goto end;
+			tmp = SWAP32(tmp);
+			if(!memcmp(atom,"stco",4)) break;
+			if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+		}
+		
+		int *stco = (int *)malloc(tmp-8);
+		if(fread(stco,1,tmp-8,fp) < tmp-8) goto end;
+		int nElement = SWAP32(stco[1]);
+		
+		/* update stco atom */
+		for(i=0;i<nElement;i++) {
+			stco[2+i] = SWAP32(SWAP32(stco[2+i])+moovSize);
+		}
+		if(fseeko(fp,8-(int)tmp,SEEK_CUR) != 0) goto end;
+		if(fwrite(stco,1,tmp-8,fp) < tmp-8) goto end;
+		
+		free(stco);
+
+		if(fseeko(fp,pos_next,SEEK_SET) != 0) goto end;
+	}
+	
+	rewind(fp);
+	
+	/* save moov atom */
+	
+	moovbuf = (char *)malloc(moovSize);
+	if(fseeko(fp,pos_moov,SEEK_SET) != 0) goto end;
+	if(fread(moovbuf,1,moovSize,fp) < moovSize) goto end;
+	rewind(fp);
+	
+	while(1) { //skip until ftyp;
+		if(fread(&tmp,4,1,fp) < 1) goto end;
+		if(fread(atom,1,4,fp) < 4) goto end;
+		tmp = SWAP32(tmp);
+		if(!memcmp(atom,"ftyp",4)) break;
+		if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+	}
+	
+	/* position after ftyp atom is the inserting point */
+	if(fseeko(fp,tmp-8,SEEK_CUR) != 0) goto end;
+	pos_moov = ftello(fp);
+	
+	/* optimize */
+	
+	__int64 bytesToMove = origSize-pos_moov-moovSize;
+	
+	if(bytesToMove < moovSize) {
+		if(bufferSize < bytesToMove) {
+			tmpbuf = (char *)realloc(tmpbuf,(size_t)bytesToMove);
+			read = tmpbuf;
+		}
+		if(fread(read,1,(size_t)bytesToMove,fp) < bytesToMove) goto end;
+		if(fseeko(fp,(__int64)moovSize-bytesToMove,SEEK_CUR) != 0) goto end;
+		if(fwrite(read,1,(size_t)bytesToMove,fp) < bytesToMove) goto end;
+	}
+	else if(bytesToMove > bufferSize) {
+		if(bufferSize < moovSize) {
+			tmpbuf = (char *)realloc(tmpbuf,moovSize);
+			tmpbuf2 = (char *)realloc(tmpbuf2,moovSize);
+			read = tmpbuf;
+			write = tmpbuf2;
+			bufferSize = moovSize;
+			if(bytesToMove <= bufferSize) goto moveBlock_is_smaller_than_buffer;
+		}
+		if(fread(write,1,bufferSize,fp) < bufferSize) goto end;
+		bytesToMove -= bufferSize;
+		while(bytesToMove > bufferSize) {
+			if(fread(read,1,bufferSize,fp) < bufferSize) goto end;
+			if(fseeko(fp,(__int64)moovSize-2*(__int64)bufferSize,SEEK_CUR) != 0) goto end;
+			if(fwrite(write,1,bufferSize,fp) < bufferSize) goto end;
+			if(fseeko(fp,(__int64)bufferSize-(__int64)moovSize,SEEK_CUR) != 0) goto end;
+			swap = read;
+			read = write;
+			write = swap;
+			bytesToMove -= bufferSize;
+			//NSLog(@"DEBUG: %d bytes left",bytesToMove);
+		}
+		if(fread(read,1,(size_t)bytesToMove,fp) < bytesToMove) goto end;
+		if(fseeko(fp,(__int64)moovSize-(__int64)bufferSize-bytesToMove,SEEK_CUR) != 0) goto end;
+		if(fwrite(write,1,bufferSize,fp) < bufferSize) goto end;
+		if(fwrite(read,1,(size_t)bytesToMove,fp) < bytesToMove) goto end;
+	}
+	else {
+moveBlock_is_smaller_than_buffer:
+		if(fread(read,1,(size_t)bytesToMove,fp) < bytesToMove) goto end;
+		if(moovSize < bytesToMove) {
+			if(fseeko(fp,(__int64)moovSize-bytesToMove,SEEK_CUR) != 0) goto end;
+		}
+		else {
+			if(fseeko(fp,0-bytesToMove,SEEK_CUR) != 0) goto end;
+			if(fwrite(moovbuf,1,moovSize,fp) < moovSize) goto end;
+		}
+		if(fwrite(read,1,(size_t)bytesToMove,fp) < bytesToMove) goto end;
+	}
+	
+	if(fseeko(fp,pos_moov,SEEK_SET) != 0) goto end;
+	if(fwrite(moovbuf,1,moovSize,fp) < moovSize) goto end;
+	
+end:
+	if(moovbuf) free(moovbuf);
+	free(tmpbuf);
+	free(tmpbuf2);
+}
 
 int _encode(FILE * hFile, AudioCoder * encoder,  int len, char * buf, int bMPEG4AAC)
 {
@@ -162,16 +345,37 @@ int _encode(FILE * hFile, AudioCoder * encoder,  int len, char * buf, int bMPEG4
 	return 0;
 }
 
+int _finalize(FILE * hFile, AudioCoder * encoder, char * buf, int bMPEG4AAC)
+{
+	static char outbuffer[BUFSIZE];
+	DWORD dwBytesWritten=0;
+	int i=0;
+	for(;;)
+	{
+		int in_used=0;
+		//if(!len) break; - we must finalize it !
+		int enclen=encoder->Encode(i++,buf,0,&in_used,outbuffer,sizeof(outbuffer));
+		if(enclen>0)
+		{
+			if(0==bMPEG4AAC) outbuffer[1] |= 0x08;  // force MPEG2
+			if(1==bMPEG4AAC) outbuffer[1] &= 0xf7;  // force MPEG4
+			fwrite(outbuffer, 1, enclen, hFile);
+		}
+		else break;
+	}
+	return 0;
+}
+
 void showLogo()
 {
 	printf("\n********************************************************************\n* AACPlus v2 Encoder (using Winamp enc_aacplus.dll and nscrt.dll)\n* Coding Technologies encoder 8.0.3\n* Build %s, %s\n********************************************************************\n",
 		 __DATE__, __TIME__);
 }
 
-void showUsage(char* exeName)
+void showUsage(_TCHAR* exeName)
 {
-	char exeName2[MAX_PATH];
-	_splitpath(exeName, NULL, NULL, exeName2, NULL);
+	_TCHAR exeName2[MAX_PATH];
+	_tsplitpath(exeName, NULL, NULL, exeName2, NULL);
 	showLogo();
 	printf("\nUsage:\n\t%s <wav_file> <bitstream_file> [options]\n", exeName2);
 	printf("Options:\n");
@@ -195,7 +399,7 @@ void showUsage(char* exeName)
 	printf("The output can be a raw .aac file or a MPEG4 ISO compilant .mp4/.m4a\n(libmp4v2.dll [from Winamp folder] must be in the same directory)\n");
 }
 
-int main(int argc, char* argv[])
+int _tmain(int argc, _TCHAR* argv[])
 {
 	int nChannelCount;
 	int nSampleRate;
@@ -210,16 +414,17 @@ int main(int argc, char* argv[])
 	int bPNS = 0;
 	int nType=1;        //0- he, 1 - lc, 2 - he-high, 3-PS
 	DWORD dwBytesRead;
+	_TCHAR szTempDir[MAX_PATH];
 	char szTempName[MAX_PATH];
 	char lpPathBuffer[BUFSIZE];
 
-	char * strOutputFileName = NULL;
-	char * strInputFileName = NULL;
+	_TCHAR * strOutputFileName = NULL;
+	_TCHAR * strInputFileName = NULL;
 	FILE*  hInput=NULL;
 	FILE*  hOutput=NULL;
 	wavHeader wav;
-	using namespace std;
 
+	_tsetlocale(LC_ALL, _T(""));
 
 	if(argc<2)
 	{
@@ -233,73 +438,73 @@ int main(int argc, char* argv[])
 	// let's parse command line
 	for(int i=3;i<argc;++i)
 	{
-		if(0==strcmp("--rawpcm", argv[i]))
+		if(0==_tcscmp(_T("--rawpcm"), argv[i]))
 		{
-			nSampleRate=atoi(argv[++i]);
-			nChannelCount=atoi(argv[++i]);
-			nBitsPerSample=atoi(argv[++i]);
+			nSampleRate=_tstoi(argv[++i]);
+			nChannelCount=_tstoi(argv[++i]);
+			nBitsPerSample=_tstoi(argv[++i]);
 			bRawPCM=1;
 			continue;
 		}
 
-		if(0==strcmp("--mono", argv[i]))
+		if(0==_tcscmp(_T("--mono"), argv[i]))
 		{
 			nChannelMode=1;
 			continue;
 		}
-		if(0==strcmp("--ps", argv[i]))
+		if(0==_tcscmp(_T("--ps"), argv[i]))
 		{
 			bNoPS=1;
 			nType=0;
 			//nChannelMode=4; assigned only if bitrate <=56000
 			continue;
 		}
-		if(0==strcmp("--is", argv[i]))
+		if(0==_tcscmp(_T("--is"), argv[i]))
 		{
 			nChannelMode=3;
 			continue;
 		}
-		if(0==strcmp("--dc", argv[i]))
+		if(0==_tcscmp(_T("--dc"), argv[i]))
 		{
 			nChannelMode=5;
 			continue;
 		}
-		if(0==strcmp("--he", argv[i]))
+		if(0==_tcscmp(_T("--he"), argv[i]))
 		{
 			nType=0;
 			continue;
 		}
-		if(0==strcmp("--lc", argv[i]))
+		if(0==_tcscmp(_T("--lc"), argv[i]))
 		{
 			nType=1;
 			continue;
 		}
-		if(0==strcmp("--high", argv[i]))
+		if(0==_tcscmp(_T("--high"), argv[i]))
 		{
 			nType=2;
 			continue;
 		}
-		if(0==strcmp("--br", argv[i]))
+		if(0==_tcscmp(_T("--br"), argv[i]))
 		{
-			nBitrate=atoi(argv[++i]);
+			nBitrate=_tstoi(argv[++i]);
 			continue;
 		}
-		if(0==strcmp("--mpeg2aac", argv[i]))
+		if(0==_tcscmp(_T("--mpeg2aac"), argv[i]))
 		{
 			bMPEG4AAC=0;
 			continue;
 		}
-		if(0==strcmp("--mpeg4aac", argv[i]))
+		if(0==_tcscmp(_T("--mpeg4aac"), argv[i]))
 		{
 			bMPEG4AAC=1;
 			continue;
 		}
-		if(0==strcmp("--speech", argv[i]))
+		if(0==_tcscmp(_T("--speech"), argv[i]))
 		{
 			bSpeech=1;
 			continue;
 		}
-		if(0==strcmp("--pns", argv[i]))
+		if(0==_tcscmp(_T("--pns"), argv[i]))
 		{
 			bPNS=1;
 			continue;
@@ -308,7 +513,7 @@ int main(int argc, char* argv[])
 
 	showLogo();
 
-	int bStdIn = 0==strcmp("-", strInputFileName)?1:0;
+	int bStdIn = 0==_tcscmp(_T("-"), strInputFileName)?1:0;
 	// let's open WAV file
 	if(bStdIn)
 	{
@@ -319,7 +524,7 @@ int main(int argc, char* argv[])
 	}
 	else
 	{
-		hInput = fopen(strInputFileName,"rb");
+		hInput = _tfopen(strInputFileName,_T("rb"));
 	}
 
 	if(!hInput)
@@ -394,9 +599,9 @@ int main(int argc, char* argv[])
 			break;
 	}
 
-	const char* channelModes[] = {"Multichannel", "Mono", "Stereo", "Independant Stereo", "Parametric Stereo", "Dual Channels"};
-	const char* codecName[] = {"HE-AAC","LC-AAC","HE-AAC High","HE-AAC+PS"};
-	const char* BooleanResult[] = {"No", "Yes"};
+	const _TCHAR* channelModes[] = {_T("Multichannel"), _T("Mono"), _T("Stereo"), _T("Independant Stereo"), _T("Parametric Stereo"), _T("Dual Channels")};
+	const _TCHAR* codecName[] = {_T("HE-AAC"),_T("LC-AAC"),_T("HE-AAC High"),_T("HE-AAC+PS")};
+	const _TCHAR* BooleanResult[] = {_T("No"), _T("Yes")};
 
 	nBitrate		= min(max(minBitrate, nBitrate), maxBitrate);
 
@@ -406,40 +611,44 @@ int main(int argc, char* argv[])
 		nType=3;
 
 	// just to be sure that we have the correct mode
-	string s1 = strOutputFileName;
-	size_t ext_pos = s1.find_last_of( '.' );
-	if ( ext_pos != string::npos ) {
-		char buf[5];
-		size_t length = s1.copy(buf, ext_pos, 4);
-		if ( (length = '.M4A') || (length = '.m4a') || (length = '.MP4') || (length = '.mp4') ) {
-			mp4mode = 1;
-		}
+	_TCHAR *ext = PathFindExtension(strOutputFileName);
+	if(ext) {
+		if(!_tcsicmp(ext,_T(".m4a")) || !_tcsicmp(ext,_T(".mp4"))) mp4mode = 1;
 	}
 
 	// let's write used config:
-	printf("\nInput file: %s\nOutput file: %s\nSampleRate: %d\nChannelCount: %d\nBitsPerSample: %d\nBitrate: %d\nChannelMode: %s\nEngine: %s\nTune For Speech: %s\nPNS: %s\nMP4 Output: %s\n",
+	_tprintf(_T("\nInput file: %s\nOutput file: %s\nSampleRate: %d\nChannelCount: %d\nBitsPerSample: %d\nBitrate: %d\nChannelMode: %s\nEngine: %s\nTune For Speech: %s\nPNS: %s\nMP4 Output: %s\n"),
 		strInputFileName, strOutputFileName, nSampleRate, nChannelCount,nBitsPerSample , nBitrate, channelModes[nChannelMode], codecName[nType], BooleanResult[bSpeech?1:0], BooleanResult[bPNS?1:0], BooleanResult[mp4mode?1:0]);
+	fflush(stdout);
 
 	if (4==nChannelMode) //back
 		nType=0;
 
 	//create temp file name
-	memset(lpPathBuffer,0,sizeof(lpPathBuffer));
-	memset(szTempName,0,sizeof(szTempName));
+#ifdef UNICODE
+	_TCHAR tempFileW[MAX_PATH];
+#endif
 	GetTempPath(
-		sizeof(lpPathBuffer)/4,   // length of the buffer
-        lpPathBuffer);      // buffer for path
-
-	GetTempFileName(lpPathBuffer, // directory for temp files
+		MAX_PATH,   // length of the buffer
+        szTempDir);      // buffer for path
+#ifdef UNICODE
+	GetTempFileName(szTempDir, // directory for temp files
+        NULL,                    // temp file name prefix
+        0,                        // create unique name
+        tempFileW);              // buffer for name
+	wcstombs_s(NULL,szTempName,MAX_PATH,tempFileW,(MAX_PATH)*sizeof(_TCHAR));
+#else
+	GetTempFileName(szTempDir, // directory for temp files
         NULL,                    // temp file name prefix
         0,                        // create unique name
         szTempName);              // buffer for name
+#endif
 
 	AudioCoder * encoder=NULL;
-	AudioCoder *(*finishAudio3)(char *fn, AudioCoder *c)=NULL;
-	void (*prepareToFinish)(const char *filename, AudioCoder *coder)=NULL;
+	AudioCoder *(*finishAudio3)(_TCHAR *fn, AudioCoder *c)=NULL;
+	void (*prepareToFinish)(_TCHAR *filename, AudioCoder *coder)=NULL;
 	AudioCoder* (*createAudio3)(int nch, int srate, int bps, unsigned int srct, unsigned int *outt, char *configfile)=NULL;
-	HMODULE encplug = LoadLibrary("enc_aacplus.dll");
+	HMODULE encplug = LoadLibrary(_T("enc_aacplus.dll"));
 	if(NULL == encplug)
 	{
 		fclose(hInput);
@@ -454,8 +663,13 @@ int main(int argc, char* argv[])
 		printf("Can't find CreateAudio3 in enc_aacplus.dll!\n");
 		return ERROR_CANNOT_LOAD_DECODER;
 	}
+#ifdef UNICODE
+	*(void **)&finishAudio3=(void *)GetProcAddress(encplug,"FinishAudio3W");
+	*(void **)&prepareToFinish=(void *)GetProcAddress(encplug,"PrepareToFinishW");
+#else
 	*(void **)&finishAudio3=(void *)GetProcAddress(encplug,"FinishAudio3");
 	*(void **)&prepareToFinish=(void *)GetProcAddress(encplug,"PrepareToFinish");
+#endif
 
 	{
 		//const char* codecSection[] = {"audio_aacplus","audio_aac","audio_aacplushigh"};
@@ -472,10 +686,9 @@ int main(int argc, char* argv[])
 		else
 			outt = mp4mode ? mmioFOURCC('M','4','A','+') : mmioFOURCC('A','A','C','P');
 		encoder=createAudio3(nChannelCount,nSampleRate, nBitsPerSample ,mmioFOURCC('P','C','M',' '),&outt,szTempName);
-		DeleteFile(szTempName);
+		DeleteFileA(szTempName);
 	}
 
-	strcat(szTempName,".aac");
 
 	if(NULL==encoder)
 	{
@@ -485,7 +698,7 @@ int main(int argc, char* argv[])
 		return ERROR_CANNOT_OPEN_ENCODER;
 	}
 
-	hOutput = fopen(mp4mode ? szTempName : strOutputFileName, "wb");
+	hOutput = _tfopen(strOutputFileName, _T("wb"));
 
 	if (!hOutput)
         {
@@ -508,12 +721,22 @@ int main(int argc, char* argv[])
 
 	// finalize encoding
 	if(prepareToFinish) prepareToFinish(strOutputFileName,encoder);
-	_encode(hOutput, encoder, 0, lpPathBuffer, bMPEG4AAC);
-	if (finishAudio3) finishAudio3(strOutputFileName,encoder);
+	_finalize(hOutput, encoder, lpPathBuffer, bMPEG4AAC);
 	fclose(hOutput);
+	if (finishAudio3) finishAudio3(strOutputFileName,encoder);
 	fclose(hInput);
 	delete encoder;
 	FreeLibrary(encplug);
+
+	if(mp4mode) {
+		struct __stat64 statbuf;
+		if(!_tstat64(strOutputFileName,&statbuf)) {
+			if(!_tfopen_s(&hOutput,strOutputFileName,_T("r+b"))) {
+				optimizeAtoms(hOutput,statbuf.st_size);
+			}
+			if(hOutput) fclose(hOutput);
+		}
+	}
 
 	// shut down
 	printf("\rDone           \n");
